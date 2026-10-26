@@ -1215,6 +1215,146 @@ static bool hostBringUp (const char **why)
 }
 }
 
+// ---- Link report and read rates (native-ufs-diagnostics=2) -------------------------------------------------------------
+// What the boot loader left the link at (UniPro PA attributes through DME_GET, the device's own maximum through DME_PEER_GET),
+// the GCC clock sources of the controller, and how fast READ(10) runs on this transport: 128 KiB commands in sequence from the
+// start of userdata, then 4 KiB ones spread over its first 2 GiB, each timed from the command to its completion. Read only.
+#if !defined(NATIVE_UFS_PROBE_ONLY)
+extern "C" {
+char native_ufs_link_rows[3][120];
+}
+namespace {
+// UIC command (UFSHCI): UCRDY is HCS bit 3, UCCS is IS bit 10; UICCMD 0x90, UCMDARG1..3 0x94..0x9c. Under gHost.lock.
+static bool hostUicGet (uint32_t opcode, uint32_t attribute, uint32_t *value)
+{
+  uint64_t deadline;
+  clock_interval_to_deadline (100, kMillisecondScale, &deadline);
+  while (!(read32 (gHost.hc, 0x30) & 8)) {
+    if (mach_absolute_time () >= deadline) return false;
+    IODelay (10);
+  }
+  hostWrite (0x20, 1U << 10);
+  hostWrite (0x94, attribute << 16);
+  hostWrite (0x98, 0);
+  hostWrite (0x9c, 0);
+  hostWrite (0x90, opcode);
+  while (!(read32 (gHost.hc, 0x20) & (1U << 10))) {
+    if (mach_absolute_time () >= deadline) return false;
+    IODelay (10);
+  }
+  hostWrite (0x20, 1U << 10);
+  if (read32 (gHost.hc, 0x98) & 0xff) return false;
+  *value = read32 (gHost.hc, 0x9c);
+  return true;
+}
+
+static int uicAttribute (uint32_t opcode, uint32_t attribute)
+{
+  uint32_t value = 0;
+  return hostUicGet (opcode, attribute, &value) ? static_cast<int> (value) : -1;
+}
+
+static void hostLinkReport (void)
+{
+  if (!gHost.ready) return;
+  // PA_ActiveTxDataLanes, PA_ConnectedTxDataLanes, PA_TxGear, PA_HSSeries (1 A, 2 B), PA_PWRMode (rx << 4 | tx: 1 fast, 2 slow,
+  // 4 fast auto, 5 slow auto), PA_ActiveRxDataLanes, PA_ConnectedRxDataLanes, PA_RxGear, PA_MaxRxHSGear; the last one again of the device.
+  static const uint32_t kAttributes[] = { 0x1560, 0x1561, 0x1568, 0x156a, 0x1571, 0x1580, 0x1581, 0x1583, 0x1587 };
+  int v[10];
+  IOLockLock (gHost.lock);
+  for (unsigned i = 0; i < 9; ++i) v[i] = uicAttribute (1, kAttributes[i]);
+  v[9] = uicAttribute (3, 0x1587);
+  IOLockUnlock (gHost.lock);
+  snprintf (native_ufs_link_rows[0], sizeof native_ufs_link_rows[0],
+            "UFS link tx gear %d lanes %d/%d | rx gear %d lanes %d/%d | series %d mode %02x | max rx gear host %d device %d",
+            v[2], v[0], v[1], v[7], v[5], v[6], v[3], v[4] & 0xff, v[8], v[9]);
+#if defined(NATIVE_UFS_SM6225)
+  // RCG CMD (bit 31 ROOT_OFF) and CFG (SRC_DIV bits 4:0 = 2 x divider - 1, SRC_SEL bits 10:8: 0 XO, 1 GPLL0 600 MHz, 2 GPLL0
+  // even 300 MHz; MODE bits 13:12 for an M/N divider) of the AXI, ICE core and UniPro core clocks (gcc-khaje.c).
+  OSSharedPtr<IOMemoryMap> keep;
+  const uintptr_t gcc = mapPhys (GCC_BASE + GCC_UFS_BLOCK, 0x1000, keep);
+  if (gcc) {
+    static const uint32_t kRcg[] = { 0x020, 0x048, 0x060 };
+    unsigned mhz[3];
+    uint32_t cfg[3], off = 0;
+    for (unsigned i = 0; i < 3; ++i) {
+      off |= (read32 (gcc, kRcg[i]) >> 31) << i;
+      cfg[i] = read32 (gcc, kRcg[i] + 4);
+      const unsigned source = (cfg[i] >> 8) & 7, divider = cfg[i] & 0x1f;
+      const unsigned parentKhz = source == 0 ? 19200 : source == 1 ? 600000 : source == 2 ? 300000 : 0;
+      mhz[i] = (divider ? parentKhz * 2 / (divider + 1) : parentKhz) / 1000;
+    }
+    snprintf (native_ufs_link_rows[1], sizeof native_ufs_link_rows[1],
+              "UFS clk axi %u MHz ice %u MHz unipro %u MHz | cfg %08x %08x %08x off %x", mhz[0], mhz[1], mhz[2], cfg[0], cfg[1],
+              cfg[2], off);
+  }
+#endif
+}
+
+#if defined(NATIVE_UFS_SM6225)
+static uint64_t ticksToUs (uint64_t ticks)
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds (ticks, &ns);
+  return ns / 1000;
+}
+
+static void hostReadRates (unsigned mib)
+{
+  if (!gHost.ready || !mib || mib > 1024) return;
+  uint8_t *scratch = static_cast<uint8_t *> (IOMalloc (kDataMax));
+  if (!scratch) return;
+  uint64_t seq = 0, seqMax = 0, spread = 0, spreadMax = 0;
+  unsigned seqCommands = 0, spreadCommands = 0;
+  IOLockLock (gHost.lock);
+  for (uint64_t at = 0; at < mib * 256ULL && gHost.ready; at += kDataMax / 4096) {
+    const uint64_t lba = UFS_USERDATA_FIRST + at;
+    uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba), 0, 0,
+                        uint8_t (kDataMax / 4096), 0 };
+    uint32_t scsi = 0;
+    const uint64_t t0 = mach_absolute_time ();
+    if (hostScsi (0, cdb, 10, true, kDataMax, 1000000, &scsi) != kIOReturnSuccess) break;
+    const uint64_t t = mach_absolute_time () - t0;
+    seq += t;
+    if (t > seqMax) seqMax = t;
+    ++seqCommands;
+  }
+  for (unsigned i = 0; i < 512 && gHost.ready; ++i) {
+    const uint64_t lba = UFS_USERDATA_FIRST + (uint64_t (i) * 7919 * 16) % (512ULL << 10);
+    uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba), 0, 0, 1, 0 };
+    uint32_t scsi = 0;
+    const uint64_t t0 = mach_absolute_time ();
+    if (hostScsi (0, cdb, 10, true, 4096, 1000000, &scsi) != kIOReturnSuccess) break;
+    const uint64_t t = mach_absolute_time () - t0;
+    spread += t;
+    if (t > spreadMax) spreadMax = t;
+    ++spreadCommands;
+  }
+  // What each 128 KiB command spends on the CPU besides the transfer: the clean before and the invalidate after it, and the copy out.
+  uint64_t t0 = mach_absolute_time ();
+  for (unsigned i = 0; i < 16; ++i) {
+    cacheCivac (gHost.virt, kDataOffset + kDataMax);
+    cacheInvalidate (gHost.virt, kDataOffset + kDataMax);
+  }
+  const uint64_t cache = mach_absolute_time () - t0;
+  t0 = mach_absolute_time ();
+  for (unsigned i = 0; i < 16; ++i) memcpy (scratch, gHost.virt + kDataOffset, kDataMax);
+  const uint64_t copy = mach_absolute_time () - t0;
+  IOLockUnlock (gHost.lock);
+  IOFree (scratch, kDataMax);
+  const uint64_t seqUs = ticksToUs (seq), seqBytes = uint64_t (seqCommands) * kDataMax;
+  snprintf (native_ufs_link_rows[2], sizeof native_ufs_link_rows[2],
+            "UFS read 128K x%u %llu MiB/s max %llu us | 4K x%u avg %llu us max %llu us | 128K cache %llu us copy %llu us",
+            seqCommands, seqUs ? (unsigned long long) (seqBytes * 1000000 / seqUs >> 20) : 0ULL,
+            (unsigned long long) ticksToUs (seqMax), spreadCommands,
+            spreadCommands ? (unsigned long long) (ticksToUs (spread) / spreadCommands) : 0ULL,
+            (unsigned long long) ticksToUs (spreadMax), (unsigned long long) (ticksToUs (cache) / 16),
+            (unsigned long long) (ticksToUs (copy) / 16));
+}
+#endif
+}
+#endif
+
 namespace {
 static uint32_t be32w (const uint8_t *at)
 {
@@ -2167,7 +2307,7 @@ bool NativeUfs::start (IOService *provider)
   }
   unsigned diagnostic = 0;
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
-  gRootDiagnosticEnabled = diagnostic == 1;
+  gRootDiagnosticEnabled = diagnostic == 1 || diagnostic == 2;
 #if defined(NATIVE_UFS_PROBE_ONLY)
   // The block device and root publication pull in IOStorageFamily/VerifiedRoot.
   // A probe-only build keeps the controller probes and says so if asked for them.
@@ -2322,6 +2462,14 @@ bool NativeUfs::startRoot (IOService *provider)
     IOLog ("NativeUfs: root bring-up failed: %s\n", why);
     return false;
   }
+  hostLinkReport ();
+#if defined(NATIVE_UFS_SM6225)
+  // native-ufs-diagnostics=2: the diagnostics of 1, and the reads timed over 64 MiB (a boot argument of its own would not fit the
+  // kernel command line's 1000 bytes on tb128fu).
+  unsigned diagnostic = 0;
+  PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
+  if (diagnostic == 2) hostReadRates (64);
+#endif
   native_ufs_root_step = 2;
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
