@@ -1,7 +1,7 @@
-# NativeUfs
+# ShengUfs
 
-Native UFS storage driver. Owns the host controller, SMMU, queues and the root read path.
+SM8550 UFS transport and sheng persistent storage.
 
-Current state: the native UFS root works on sheng.
+the native UFS root works on sheng.
 
-Linked into XNU by `unixnu build kernel`.
+Build and interface details: [documentation](https://unixnu.com/drivers/sheng-ufs). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
