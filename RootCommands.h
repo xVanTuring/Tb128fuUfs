@@ -36,7 +36,8 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   if (!timeoutUs || dataBytes > kDataMax || (dataBytes & 3) ||
       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
   if (gHost.poisoned) return kIOReturnNotReady;
-  if (read32 (gHost.hc, 0x58) != 0) {
+  // Slot 0's doorbell only: the read slots (RootSlots.h) have requests of their own in flight.
+  if (read32 (gHost.hc, 0x58) & 1) {
     gHost.poisoned = true;
     gHost.ready = false;
     return recordTransport (kIOReturnBusy, *ocs);
@@ -75,7 +76,15 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     prd[2] = 0;
     prd[3] = dataBytes - 1;
   }
-  cacheCivac (gHost.virt, kDataOffset + dataBytes);
+  // Only the lines this command uses (tb128fu-088: a clean and an invalidate of all 136 KiB took 454 us of a 128 KiB read's
+  // 670). Slot 0's descriptor line alone: the request list page also holds the read slots' descriptors, and an invalidate there
+  // would discard one being written. Then the command UPIU through its PRDT entry (hostClearUcd zeroed the response area with
+  // it, so that is cleaned too), and the data a write sends. A read's data lines are clean (the CPU only reads them, and a
+  // write's were cleaned before it was sent), so nothing can be written back over the DMA; the invalidate after it drops what
+  // was prefetched meanwhile.
+  cacheCivac (gHost.virt, 64);
+  cacheCivac (gHost.virt + kUcdOffset, kPrdtOffset + 16);
+  if (direction == 1) cacheCivac (gHost.virt + kDataOffset, dataBytes);
   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
   HardwareTransferPort port;
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
@@ -93,7 +102,8 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     gHost.ready = false;
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
-  cacheInvalidate (gHost.virt, kDataOffset + dataBytes);
+  cacheInvalidate (gHost.virt + kUcdOffset + kRspOffset, 512);
+  if (direction == 2) cacheInvalidate (gHost.virt + kDataOffset, dataBytes);
   gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
 }
@@ -102,7 +112,7 @@ static bool hostClearUcd (void)
 {
   if (gHost.poisoned) return false;
   // Check before touching the command/response area, not just before ringing.
-  if (read32 (gHost.hc, 0x58) != 0) {
+  if (read32 (gHost.hc, 0x58) & 1) {
     gHost.poisoned = true;
     gHost.ready = false;
     recordTransport (kIOReturnBusy, 15);

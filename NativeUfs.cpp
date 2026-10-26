@@ -57,6 +57,15 @@ volatile uint32_t native_ufs_hce = 0;
 volatile uint32_t native_ufs_utrl_ready = 0;
 volatile uint32_t native_ufs_uic_status = 0;
 volatile uint32_t native_ufs_uic_result = 0;
+// Read slots (RootSlots.h): [0] reads, [1] failed, [2] interrupts, [3] waits that slept, [4] longest read in us, [5] most in
+// flight, [6] in flight, [7] start state (bits 0-7 slots ready, bit 8 interrupt attached, bits 16-23 the attach result's low byte,
+// bits 32-63 UTRIACR as found; 0xff000001: the controller has too few request slots).
+volatile uint64_t native_ufs_slot_stats[8];
+// ArmCpu's SPI handlers (drivers/ArmCpu); without it the slots poll every 20 us.
+IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context, uint32_t *readback,
+                            uint64_t *router) __attribute__((weak_import));
+// osfmk/kern/sched_prim.h declares it for XNU_KERNEL_PRIVATE only.
+kern_return_t clear_wait (thread_t thread, wait_result_t result);
 }
 
 #if defined(NATIVE_UFS_PROBE_ONLY)
@@ -986,6 +995,9 @@ static void hostWrite (unsigned offset, uint32_t value)
 #include "RootQueue.h"
 
 #include "RootCommands.h"
+#if !defined(NATIVE_UFS_PROBE_ONLY)
+#include "RootSlots.h"
+#endif
 
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
@@ -1224,8 +1236,9 @@ extern "C" {
 char native_ufs_link_rows[3][120];
 }
 namespace {
-// UIC command (UFSHCI): UCRDY is HCS bit 3, UCCS is IS bit 10; UICCMD 0x90, UCMDARG1..3 0x94..0x9c. Under gHost.lock.
-static bool hostUicGet (uint32_t opcode, uint32_t attribute, uint32_t *value)
+// UIC command (UFSHCI): UCRDY is HCS bit 3, UCCS is IS bit 10; UICCMD 0x90, UCMDARG1..3 0x94..0x9c. DME_GET 1, DME_SET 2,
+// DME_PEER_GET 3. `value` is what a set writes and what a get returns. Under gHost.lock, with no request in flight.
+static bool hostUic (uint32_t opcode, uint32_t attribute, uint32_t *value)
 {
   uint64_t deadline;
   clock_interval_to_deadline (100, kMillisecondScale, &deadline);
@@ -1236,7 +1249,7 @@ static bool hostUicGet (uint32_t opcode, uint32_t attribute, uint32_t *value)
   hostWrite (0x20, 1U << 10);
   hostWrite (0x94, attribute << 16);
   hostWrite (0x98, 0);
-  hostWrite (0x9c, 0);
+  hostWrite (0x9c, opcode == 2 ? *value : 0);
   hostWrite (0x90, opcode);
   while (!(read32 (gHost.hc, 0x20) & (1U << 10))) {
     if (mach_absolute_time () >= deadline) return false;
@@ -1244,14 +1257,44 @@ static bool hostUicGet (uint32_t opcode, uint32_t attribute, uint32_t *value)
   }
   hostWrite (0x20, 1U << 10);
   if (read32 (gHost.hc, 0x98) & 0xff) return false;
-  *value = read32 (gHost.hc, 0x9c);
+  if (opcode != 2) *value = read32 (gHost.hc, 0x9c);
   return true;
 }
 
 static int uicAttribute (uint32_t opcode, uint32_t attribute)
 {
   uint32_t value = 0;
-  return hostUicGet (opcode, attribute, &value) ? static_cast<int> (value) : -1;
+  return hostUic (opcode, attribute, &value) ? static_cast<int> (value) : -1;
+}
+
+// Every connected TX lane (tb128fu-088: the boot loader left the host's TX on 1 of 2 connected lanes, its RX on 2 of 2, both
+// at HS-G3 rate B, so writes went at half rate), as ufshcd_change_power_mode does it: both directions' gears, lanes,
+// terminations and series, the UniPro timeouts of PA_PWRModeUserData0..5 and DME_Local*, then PA_PWRMode (fast both ways)
+// starts the change; IS.UPMS ends it and HCS.UPMCRS says how (1, PWR_LOCAL, is success). The QMP v4 PHY has no TX lane enable
+// (phy-qcom-ufs-qmp-v4.c), and the host's clocks and timers stay: gear and rate do not change. Returns UPMCRS, 0x10 + the
+// failing step's index when a set failed, 0x20 when the change did not end. Under gHost.lock, before any read slot starts.
+static uint32_t hostWidenTx (uint32_t txLanes, uint32_t rxLanes, uint32_t txGear, uint32_t rxGear, uint32_t series)
+{
+  const struct { uint32_t attribute, value; } sets[] = {
+    { 0x1583, rxGear }, { 0x1580, rxLanes }, { 0x1584, 1 }, { 0x1568, txGear }, { 0x1560, txLanes }, { 0x1569, 1 },
+    { 0x156a, series }, { 0x15b0, 8191 }, { 0x15b1, 65535 }, { 0x15b2, 32767 }, { 0x15b3, 8191 }, { 0x15b4, 65535 },
+    { 0x15b5, 32767 }, { 0xd041, 8191 }, { 0xd042, 65535 }, { 0xd043, 32767 },
+  };
+  for (unsigned i = 0; i < sizeof (sets) / sizeof (sets[0]); ++i) {
+    uint32_t value = sets[i].value;
+    if (!hostUic (2, sets[i].attribute, &value)) return 0x10 + i;
+  }
+  hostWrite (0x20, 1U << 4);
+  uint32_t mode = 0x11;
+  if (!hostUic (2, 0x1571, &mode)) return 0x1f;
+  uint64_t deadline;
+  clock_interval_to_deadline (500, kMillisecondScale, &deadline);
+  while (!(read32 (gHost.hc, 0x20) & (1U << 4))) {
+    if (mach_absolute_time () >= deadline) return 0x20;
+    IODelay (10);
+  }
+  hostWrite (0x20, 1U << 4);
+  return (read32 (gHost.hc, 0x30) >> 8) & 7;
 }
 
 static void hostLinkReport (void)
@@ -1264,10 +1307,18 @@ static void hostLinkReport (void)
   IOLockLock (gHost.lock);
   for (unsigned i = 0; i < 9; ++i) v[i] = uicAttribute (1, kAttributes[i]);
   v[9] = uicAttribute (3, 0x1587);
+  // Widened only from the fast mode the loader left, with every value read back, so the change keeps gear, series and RX lanes.
+  int before = -1;
+  uint32_t widened = 0xff;
+  if (v[0] > 0 && v[1] > v[0] && v[5] > 0 && v[2] > 0 && v[7] > 0 && v[3] > 0 && (v[4] & 0xff) == 0x11) {
+    before = v[0];
+    widened = hostWidenTx (uint32_t (v[1]), uint32_t (v[5]), uint32_t (v[2]), uint32_t (v[7]), uint32_t (v[3]));
+    for (unsigned i = 0; i < 9; ++i) v[i] = uicAttribute (1, kAttributes[i]);
+  }
   IOLockUnlock (gHost.lock);
   snprintf (native_ufs_link_rows[0], sizeof native_ufs_link_rows[0],
-            "UFS link tx gear %d lanes %d/%d | rx gear %d lanes %d/%d | series %d mode %02x | max rx gear host %d device %d",
-            v[2], v[0], v[1], v[7], v[5], v[6], v[3], v[4] & 0xff, v[8], v[9]);
+            "UFS link tx gear %d lanes %d/%d (was %d, change %x) | rx gear %d lanes %d/%d | series %d mode %02x | max rx gear %d/%d",
+            v[2], v[0], v[1], before, widened, v[7], v[5], v[6], v[3], v[4] & 0xff, v[8], v[9]);
 #if defined(NATIVE_UFS_SM6225)
   // RCG CMD (bit 31 ROOT_OFF) and CFG (SRC_DIV bits 4:0 = 2 x divider - 1, SRC_SEL bits 10:8: 0 XO, 1 GPLL0 600 MHz, 2 GPLL0
   // even 300 MHz; MODE bits 13:12 for an M/N divider) of the AXI, ICE core and UniPro core clocks (gcc-khaje.c).
@@ -1330,12 +1381,9 @@ static void hostReadRates (unsigned mib)
     if (t > spreadMax) spreadMax = t;
     ++spreadCommands;
   }
-  // What each 128 KiB command spends on the CPU besides the transfer: the clean before and the invalidate after it, and the copy out.
+  // What each 128 KiB read spends on the CPU besides the transfer: the invalidate after it, and the copy out.
   uint64_t t0 = mach_absolute_time ();
-  for (unsigned i = 0; i < 16; ++i) {
-    cacheCivac (gHost.virt, kDataOffset + kDataMax);
-    cacheInvalidate (gHost.virt, kDataOffset + kDataMax);
-  }
+  for (unsigned i = 0; i < 16; ++i) cacheInvalidate (gHost.virt + kDataOffset, kDataMax);
   const uint64_t cache = mach_absolute_time () - t0;
   t0 = mach_absolute_time ();
   for (unsigned i = 0; i < 16; ++i) memcpy (scratch, gHost.virt + kDataOffset, kDataMax);
@@ -1344,7 +1392,7 @@ static void hostReadRates (unsigned mib)
   IOFree (scratch, kDataMax);
   const uint64_t seqUs = ticksToUs (seq), seqBytes = uint64_t (seqCommands) * kDataMax;
   snprintf (native_ufs_link_rows[2], sizeof native_ufs_link_rows[2],
-            "UFS read 128K x%u %llu MiB/s max %llu us | 4K x%u avg %llu us max %llu us | 128K cache %llu us copy %llu us",
+            "UFS read 128K x%u %llu MiB/s max %llu us | 4K x%u avg %llu us max %llu us | 128K invalidate %llu us copy %llu us",
             seqCommands, seqUs ? (unsigned long long) (seqBytes * 1000000 / seqUs >> 20) : 0ULL,
             (unsigned long long) ticksToUs (seqMax), spreadCommands,
             spreadCommands ? (unsigned long long) (ticksToUs (spread) / spreadCommands) : 0ULL,
@@ -1728,6 +1776,8 @@ public:
   IOReturn getWriteCacheState (bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn setWriteCacheState (bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
+  // One piece of a queued read, on a read slot (RootSlots.h); `offset` is the piece's place in `buffer`.
+  IOReturn readPiece (UfsSlot &slot, IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t offset, uint64_t *done);
 };
 OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
 
@@ -2001,6 +2051,168 @@ bool NativeUfsBlock::start (IOService *provider)
   return true;
 }
 
+// ufsReadWindow's operations for a window. On slot 0 (no slot): the window lock guards the window's bounce buffer, which
+// hostRead4k copies the data into. On a read slot: the data lands in the slot's own buffer, which only its worker uses, and
+// is verified there; `offset` places the piece in the caller's buffer.
+namespace {
+struct UfsWindowOps {
+  IOLock *mutex;
+  UfsSlot *slot;
+  IOMemoryDescriptor *buffer;
+  uint64_t offset;
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  const vr_view *view;
+#endif
+  void lock () { if (mutex) IOLockLock (mutex); }
+  void unlock () { if (mutex) IOLockUnlock (mutex); }
+  IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+    uint64_t t0 = timerTicks ();
+    IOReturn r = slot ? hostSlotRead (*slot, lba, blocks) : hostRead4k (0, lba, blocks, out);
+    __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+    return r;
+  }
+  IOReturn verify (uint64_t index, const void *data, size_t length) {
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+    uint64_t t0 = timerTicks ();
+    int status = vr_verify_block (view, index, data, length, &vr_xnu_crypto);
+    __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+    if (status != VR_OK) {
+      gRootDiagnostic.stage = "read block integrity";
+      gRootDiagnostic.verify = static_cast<uint32_t> (status);
+      __atomic_fetch_add (&native_ufs_integrity_failures, 1, __ATOMIC_RELAXED);
+      return kIOReturnNotPrivileged;
+    }
+    __atomic_fetch_add (&native_ufs_verified_blocks, 1, __ATOMIC_RELAXED);
+    if (boot_progress_poll) boot_progress_poll ();
+#else
+    (void) index; (void) data; (void) length;
+#endif
+    return kIOReturnSuccess;
+  }
+  uint64_t copy (uint64_t at, const void *data, uint64_t length) {
+    uint64_t copied = buffer->writeBytes (offset + at, data, length);
+    if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+    return copied;
+  }
+};
+
+// ---- The read slots' queue -------------------------------------------------------------------------------------------
+// A request is cut at the 128 KiB LBA boundaries ufsReadWindow reads in, and each piece is a job for one of the workers, one per
+// read slot; the last piece to finish completes the request. Requests come from many threads, and the cluster layer reads ahead
+// without waiting, so up to gSlotCount commands are in flight and their pieces are verified on as many cores (tb128fu-088: one
+// command at a time, 143 us each, 279 thousand of them before the home screen). Nothing here sleeps for room: a request that
+// does not fit the queue is read on slot 0 instead, so a completion that starts the next read from a worker cannot block it.
+struct UfsRequest {
+  IOStorageCompletion completion;
+  uint32_t pending;
+  IOReturn status;
+  uint64_t bytes;
+};
+struct UfsJob {
+  NativeUfsBlock *window;
+  IOMemoryDescriptor *buffer;
+  UfsRequest *request;
+  UInt64 block, count;
+  uint64_t offset;
+};
+constexpr unsigned kJobs = 1024;
+UfsJob gJobs[kJobs];
+unsigned gJobHead, gJobCount, gWorkers;
+IOLock *gJobLock;
+int gJobQueued;   // the workers' wait event
+
+static void finishJob (const UfsJob &job, IOReturn status, uint64_t done)
+{
+  UfsRequest *request = job.request;
+  if (status != kIOReturnSuccess) {
+    IOReturn expected = kIOReturnSuccess;
+    __atomic_compare_exchange_n (&request->status, &expected, status, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+  }
+  __atomic_fetch_add (&request->bytes, done, __ATOMIC_RELAXED);
+  if (__atomic_sub_fetch (&request->pending, 1, __ATOMIC_ACQ_REL)) return;
+  const IOReturn result = request->status;
+  const IOStorageCompletion completion = request->completion;
+  const uint64_t bytes = result == kIOReturnSuccess ? request->bytes : 0;
+  IOFreeType (request, UfsRequest);
+  if (result != kIOReturnSuccess) {
+    __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
+    gRootDiagnostic.result = static_cast<uint32_t> (result);
+    rootDiagnosticFailure ("root window read failed");
+  }
+  completion.action (completion.target, completion.parameter, result, bytes);
+}
+
+static void slotWorker (void *argument, wait_result_t)
+{
+  UfsSlot &slot = gSlots[reinterpret_cast<uintptr_t> (argument)];
+  for (;;) {
+    IOLockLock (gJobLock);
+    while (!gJobCount) IOLockSleep (gJobLock, &gJobQueued, THREAD_UNINT);
+    const UfsJob job = gJobs[gJobHead];
+    gJobHead = (gJobHead + 1) % kJobs;
+    --gJobCount;
+    IOLockUnlock (gJobLock);
+    uint64_t done = 0;
+    const IOReturn status = job.window->readPiece (slot, job.buffer, job.block, job.count, job.offset, &done);
+    finishJob (job, status, done);
+  }
+}
+
+// After the slots are up, before any window is published.
+static void startSlotWorkers (void)
+{
+  if (!gSlotCount || !(gJobLock = IOLockAlloc ())) return;
+  unsigned started = 0;
+  for (uintptr_t i = 0; i < gSlotCount; ++i) {
+    thread_t thread = nullptr;
+    if (kernel_thread_start (slotWorker, reinterpret_cast<void *> (i), &thread) != KERN_SUCCESS) break;
+    thread_deallocate (thread);
+    ++started;
+  }
+  gWorkers = started;
+}
+
+// Queues the request's pieces; false when the workers are not running or the queue has no room for all of them.
+static bool queueRead (NativeUfsBlock *window, IOMemoryDescriptor *buffer, uint64_t absolute, UInt64 block, UInt64 count,
+                       const IOStorageCompletion &completion)
+{
+  if (!gWorkers) return false;
+  const uint64_t first = absolute + block * 512, end = first + count * 512;
+  auto next = [end] (uint64_t at) { const uint64_t boundary = (at / 4096 + kDataMax / 4096) * 4096; return boundary < end ? boundary : end; };
+  uint32_t pieces = 0;
+  for (uint64_t at = first; at < end; at = next (at)) ++pieces;
+  UfsRequest *request = IOMallocType (UfsRequest);
+  if (!request) return false;
+  *request = { completion, pieces, kIOReturnSuccess, 0 };
+  IOLockLock (gJobLock);
+  if (kJobs - gJobCount < pieces) {
+    IOLockUnlock (gJobLock);
+    IOFreeType (request, UfsRequest);
+    return false;
+  }
+  for (uint64_t at = first; at < end; at = next (at)) {
+    gJobs[(gJobHead + gJobCount) % kJobs] = { window, buffer, request, (at - absolute) / 512, (next (at) - at) / 512, at - first };
+    ++gJobCount;
+    IOLockWakeup (gJobLock, &gJobQueued, true);
+  }
+  IOLockUnlock (gJobLock);
+  return true;
+}
+}
+
+IOReturn NativeUfsBlock::readPiece (UfsSlot &slot, IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, uint64_t offset,
+                                    uint64_t *done)
+{
+  UfsWindowOps operations = { nullptr, &slot, buffer, offset
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+    , &verified
+#endif
+  };
+  UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, slot.virt + kSlotPage);
+  *done = outcome.done;
+  return outcome.status;
+}
+
 IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                            IOStorageAttributes *, IOStorageCompletion *completion)
 {
@@ -2014,44 +2226,8 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   if (!online) {
     return kIOReturnNotReady;
   }
-  struct Operations {
-    IOLock *mutex;
-    IOMemoryDescriptor *buffer;
-#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-    const vr_view *view;
-#endif
-    void lock () { IOLockLock (mutex); }
-    void unlock () { IOLockUnlock (mutex); }
-    IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
-      uint64_t t0 = timerTicks ();
-      IOReturn r = hostRead4k (0, lba, blocks, out);
-      __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
-      return r;
-    }
-    IOReturn verify (uint64_t index, const void *data, size_t length) {
-#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
-      uint64_t t0 = timerTicks ();
-      int status = vr_verify_block (view, index, data, length, &vr_xnu_crypto);
-      __atomic_fetch_add (&native_ufs_verify_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
-      if (status != VR_OK) {
-        gRootDiagnostic.stage = "read block integrity";
-        gRootDiagnostic.verify = static_cast<uint32_t> (status);
-        __atomic_fetch_add (&native_ufs_integrity_failures, 1, __ATOMIC_RELAXED);
-        return kIOReturnNotPrivileged;
-      }
-      __atomic_fetch_add (&native_ufs_verified_blocks, 1, __ATOMIC_RELAXED);
-      if (boot_progress_poll) boot_progress_poll ();
-#else
-      (void) index; (void) data; (void) length;
-#endif
-      return kIOReturnSuccess;
-    }
-    uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
-      uint64_t copied = buffer->writeBytes (offset, data, length);
-      if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
-      return copied;
-    }
-  } operations = { windowLock, buffer
+  if (queueRead (this, buffer, absolute, block, count, *completion)) return kIOReturnSuccess;
+  UfsWindowOps operations = { windowLock, nullptr, buffer, 0
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
     , &verified
 #endif
@@ -2470,6 +2646,8 @@ bool NativeUfs::startRoot (IOService *provider)
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
   if (diagnostic == 2) hostReadRates (64);
 #endif
+  // The read slots and their workers, before any window is published; without them every read stays on slot 0.
+  if (hostSlotsStart ()) startSlotWorkers ();
   native_ufs_root_step = 2;
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
